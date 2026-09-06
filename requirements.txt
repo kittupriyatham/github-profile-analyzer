@@ -5,6 +5,7 @@ beautifulsoup4
 lxml
 pdfplumber
 PyPDF2
+pypdf
 playwright
 gitpython
 tqdm
