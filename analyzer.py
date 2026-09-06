@@ -1,1007 +1,768 @@
+"""Core GitHub Profile Analyzer.
+
+The analyzer is intentionally centered around one class: ``GitHubProfileAnalyzer``.
+It is designed for two primary uses:
+
+1. Personal profile intelligence: repeatedly analyze an account and get fresh,
+   evidence-backed insights from the repositories currently accessible to it.
+2. Screening/recruiting: analyze another person's public GitHub profile and,
+   when the operator supplies a token that legitimately has access, include
+   private repositories visible to that token.
+
+Important design principle:
+    A skill is an inference, not a self-declared fact.  The result therefore
+    keeps the evidence that caused a skill/domain to be detected: repository,
+    file, line, dependency, topic, README text, etc.
+
+The class deliberately has no dependency on the spreadsheet pipeline.  The
+batch ``main.py`` adapts spreadsheet records to this class, while the class
+can also be imported and used directly.
 """
-GitHub Profile Analyzer — candidate screening pipeline.
 
-Can be used as a standalone CLI tool:
-    python analyzer.py <username> [--resume URL] [--linkedin URL] ...
+from __future__ import annotations
 
-Or imported as a library:
-    from analyzer import analyze_candidate
-    results = analyze_candidate("octocat", token="ghp_...")
-"""
-
+import argparse
+import json
+import logging
 import os
-import sys
 import re
 import shutil
 import subprocess
-import time
-import urllib.request
-import urllib.error
-import json
-import argparse
 import tempfile
-import stat
 from collections import Counter, defaultdict
-from datetime import datetime
-from typing import Any
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import Any, Iterable
 
-# ---------------------------------------------------------------------------
-# Domain taxonomy — populated at runtime by load_domain_config()
-# ---------------------------------------------------------------------------
-DOMAINS: dict[str, dict[str, set]] = {}
-DOMAIN_REGEXES: dict[str, list[tuple[str, re.Pattern]]] = {}
-IMPORTANT_THRESHOLDS: dict[str, int] = {
-    "default_min_score": 5,
-    "secondary_min_score": 15,
-}
+import requests
 
-HEADERS = {
-    "User-Agent": "GitHub-Profile-Analyzer"
-}
+logger = logging.getLogger(__name__)
 
+DEFAULT_API = "https://api.github.com"
+DEFAULT_USER_AGENT = "github-profile-analyzer"
+
+# Files that are normally binary or generated artifacts.  They are still
+# counted as repository files, but their bytes are not interpreted as source.
 BINARY_EXTENSIONS = {
-    '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tiff', '.ico', '.webp',
-    '.mp3', '.wav', '.ogg', '.flac', '.mp4', '.avi', '.mkv', '.mov', '.webm',
-    '.zip', '.tar', '.gz', '.tgz', '.rar', '.7z', '.bz2',
-    '.pdf', '.docx', '.xlsx', '.pptx',
-    '.exe', '.dll', '.so', '.dylib', '.bin', '.pyc', '.o', '.a', '.lib',
-    '.pt', '.pth', '.onnx', '.pb', '.h5', '.weights', '.tflite', '.model',
-    '.pkl', '.pickle', '.joblib', '.npy', '.npz', '.csv', '.tsv', '.json'
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".ico", ".webp",
+    ".mp3", ".wav", ".ogg", ".flac", ".mp4", ".avi", ".mkv", ".mov", ".webm",
+    ".zip", ".tar", ".gz", ".tgz", ".rar", ".7z", ".bz2", ".xz",
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".exe", ".dll", ".so", ".dylib", ".bin", ".pyc", ".o", ".a", ".lib",
+    ".pt", ".pth", ".onnx", ".pb", ".h5", ".weights", ".tflite", ".model",
+    ".pkl", ".pickle", ".joblib", ".npy", ".npz", ".class", ".jar", ".wasm",
+    ".woff", ".woff2", ".ttf", ".otf", ".db", ".sqlite", ".sqlite3",
 }
 
+# Generated/vendor directories are not evidence of the candidate's own work.
+SKIP_DIRECTORIES = {
+    ".git", ".hg", ".svn", "node_modules", "vendor", "venv", ".venv",
+    "env", ".env", "__pycache__", ".mypy_cache", ".pytest_cache", ".tox",
+    "dist", "build", "target", "coverage", ".next", ".nuxt", ".gradle",
+}
 
-# ===================================================================
-# Configuration
-# ===================================================================
+LANGUAGE_BY_EXTENSION = {
+    ".py": "Python", ".pyw": "Python", ".js": "JavaScript", ".jsx": "JavaScript",
+    ".ts": "TypeScript", ".tsx": "TypeScript", ".java": "Java", ".kt": "Kotlin",
+    ".kts": "Kotlin", ".c": "C", ".h": "C/C++", ".cc": "C++", ".cpp": "C++",
+    ".cxx": "C++", ".hpp": "C++", ".cs": "C#", ".go": "Go", ".rs": "Rust",
+    ".rb": "Ruby", ".php": "PHP", ".swift": "Swift", ".scala": "Scala",
+    ".r": "R", ".R": "R", ".jl": "Julia", ".dart": "Dart", ".lua": "Lua",
+    ".sh": "Shell", ".bash": "Shell", ".zsh": "Shell", ".ps1": "PowerShell",
+    ".sql": "SQL", ".html": "HTML", ".css": "CSS", ".scss": "SCSS",
+    ".vue": "Vue", ".svelte": "Svelte", ".sol": "Solidity", ".zig": "Zig",
+    ".ex": "Elixir", ".exs": "Elixir", ".erl": "Erlang", ".fs": "F#",
+    ".fsx": "F#", ".m": "Objective-C", ".mm": "Objective-C++",
+}
 
-def load_domain_config(config_path: str) -> None:
-    """Load domain taxonomy from external JSON config file."""
-    global DOMAINS, DOMAIN_REGEXES, IMPORTANT_THRESHOLDS
-    try:
-        with open(config_path, 'r', encoding='utf-8') as f:
-            config = json.load(f)
-    except FileNotFoundError:
-        print(f"Error: Config file not found: {config_path}", file=sys.stderr)
-        print("Create a domains.json file or specify path with --config.", file=sys.stderr)
-        sys.exit(1)
-    except json.JSONDecodeError as e:
-        print(f"Error: Invalid JSON in config file: {e}", file=sys.stderr)
-        sys.exit(1)
+DEPENDENCY_FILES = {
+    "requirements.txt", "pyproject.toml", "poetry.lock", "Pipfile", "Pipfile.lock",
+    "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+    "Cargo.toml", "Cargo.lock", "go.mod", "go.sum", "pom.xml", "build.gradle",
+    "build.gradle.kts", "Gemfile", "composer.json", "pubspec.yaml", "mix.exs",
+}
 
-    raw_domains = config.get("domains", {})
-    if not raw_domains:
-        print("Error: No domains defined in config file.", file=sys.stderr)
-        sys.exit(1)
+@dataclass
+class Evidence:
+    """A concrete observation supporting an inferred skill or signal."""
 
-    DOMAINS = {}
-    for domain, cfg in raw_domains.items():
-        DOMAINS[domain] = {
-            "libraries": set(cfg.get("libraries", [])),
-            "keywords": set(cfg.get("keywords", []))
+    skill: str
+    repository: str
+    source_type: str
+    path: str = ""
+    line: int | None = None
+    evidence: str = ""
+    strength: str = "medium"
+
+
+@dataclass
+class RepositoryInsight:
+    """Repository-level facts and evidence."""
+
+    name: str
+    full_name: str
+    url: str
+    private: bool
+    fork: bool
+    archived: bool
+    default_branch: str
+    description: str = ""
+    topics: list[str] = field(default_factory=list)
+    stars: int = 0
+    forks: int = 0
+    size_kb: int = 0
+    created_at: str = ""
+    updated_at: str = ""
+    pushed_at: str = ""
+    files_scanned: int = 0
+    source_files_scanned: int = 0
+    lines_scanned: int = 0
+    languages: dict[str, int] = field(default_factory=dict)
+    dependencies: list[str] = field(default_factory=list)
+    skills: list[str] = field(default_factory=list)
+    author_commit_count: int = 0
+    clone_error: str = ""
+
+
+class GitHubProfileAnalyzer:
+    """Analyze a GitHub account and produce evidence-backed profile insights.
+
+    ``token`` is optional. Without one, only publicly accessible repositories
+    are considered. With one, the analyzer asks GitHub for repositories
+    accessible to that token and includes private repositories owned by the
+    target account when the token has access to them.
+
+    The analyzer never sends the token to the target account, stores it in the
+    report, or puts it in a clone URL. Git receives the token through an
+    environment-backed HTTP header.
+    """
+
+    def __init__(
+        self,
+        username: str,
+        token: str | None = None,
+        config_path: str | None = None,
+        workdir: str | None = None,
+        keep_clones: bool = False,
+        exclude_forks: bool = False,
+        scan_history: bool = True,
+        max_file_bytes: int = 5 * 1024 * 1024,
+    ) -> None:
+        self.username = self._normalise_username(username)
+        self.token = token or os.getenv("GITHUB_TOKEN")
+        self.config_path = config_path
+        self.workdir = Path(workdir) if workdir else None
+        self.keep_clones = keep_clones
+        self.exclude_forks = exclude_forks
+        self.scan_history = scan_history
+        self.max_file_bytes = max_file_bytes
+
+        self.domains: dict[str, dict[str, set[str]]] = {}
+        self.domain_regexes: dict[str, list[tuple[str, re.Pattern[str]]]] = {}
+        self.evidence: list[Evidence] = []
+        self.repositories: list[RepositoryInsight] = []
+        self.profile: dict[str, Any] = {}
+        self._load_domain_config(config_path)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def analyze(self) -> dict[str, Any]:
+        """Run the complete profile analysis and return a serialisable report."""
+        user = self._api_get(f"/users/{self.username}")
+        if user is None:
+            raise RuntimeError(f"GitHub user not found or inaccessible: {self.username}")
+
+        repos = self.discover_repositories()
+        logger.info("Discovered %d repositories for %s", len(repos), self.username)
+
+        for repo in repos:
+            try:
+                self._analyze_repository(repo)
+            except Exception as exc:  # one broken repo must not abort a profile
+                logger.exception("Repository analysis failed for %s", repo.get("full_name"))
+                self.repositories.append(
+                    RepositoryInsight(
+                        name=repo.get("name", ""),
+                        full_name=repo.get("full_name", ""),
+                        url=repo.get("html_url", ""),
+                        private=bool(repo.get("private")),
+                        fork=bool(repo.get("fork")),
+                        archived=bool(repo.get("archived")),
+                        default_branch=repo.get("default_branch", ""),
+                        description=repo.get("description") or "",
+                        topics=repo.get("topics") or [],
+                        stars=int(repo.get("stargazers_count") or 0),
+                        forks=int(repo.get("forks_count") or 0),
+                        size_kb=int(repo.get("size") or 0),
+                        created_at=repo.get("created_at") or "",
+                        updated_at=repo.get("updated_at") or "",
+                        pushed_at=repo.get("pushed_at") or "",
+                        clone_error=str(exc),
+                    )
+                )
+
+        domain_scores = self._score_domains()
+        total_score = sum(domain_scores.values())
+        primary_domain = max(domain_scores, key=domain_scores.get) if total_score else "Undetermined"
+        skills = self._build_skill_insights(domain_scores)
+
+        self.profile = {
+            "username": self.username,
+            "profile_url": user.get("html_url", f"https://github.com/{self.username}"),
+            "name": user.get("name") or "",
+            "bio": user.get("bio") or "",
+            "company": user.get("company") or "",
+            "location": user.get("location") or "",
+            "blog": user.get("blog") or "",
+            "public_repos": int(user.get("public_repos") or 0),
+            "public_gists": int(user.get("public_gists") or 0),
+            "followers": int(user.get("followers") or 0),
+            "following": int(user.get("following") or 0),
+            "created_at": user.get("created_at") or "",
+            "updated_at": user.get("updated_at") or "",
+            "authenticated_access": bool(self.token),
+            "repositories_discovered": len(repos),
+            "private_repositories_analyzed": sum(1 for r in self.repositories if r.private),
+            "forks_analyzed": sum(1 for r in self.repositories if r.fork),
+            "domain_scores": domain_scores,
+            "total_score": total_score,
+            "primary_domain": primary_domain,
+            "skills": skills,
+            "languages": dict(self._language_counts()),
+            "libraries": dict(self._library_counts()),
+            "repository_insights": [asdict(r) for r in self.repositories],
+            "evidence": [asdict(e) for e in self.evidence],
+            "insights": self._build_general_insights(user),
+        }
+        return self.profile
+
+    def discover_repositories(self) -> list[dict[str, Any]]:
+        """Discover every repository relevant to this analysis.
+
+        Public-only mode uses ``/users/{user}/repos``. Authenticated mode uses
+        ``/user/repos`` with owner/collaborator/org-member affiliation and then
+        selects repositories whose owner is the target account. This is what
+        allows a token belonging to the target account (or otherwise authorized
+        for the target's private repository) to expose private repositories.
+        """
+        if self.token:
+            repos = self._paginate(
+                "/user/repos",
+                params={
+                    "visibility": "all",
+                    "affiliation": "owner,collaborator,organization_member",
+                    "per_page": 100,
+                    "sort": "full_name",
+                },
+            )
+            target = self.username.lower()
+            repos = [
+                r for r in repos
+                if str((r.get("owner") or {}).get("login", "")).lower() == target
+            ]
+        else:
+            repos = self._paginate(
+                f"/users/{self.username}/repos",
+                params={"type": "all", "per_page": 100, "sort": "full_name"},
+            )
+
+        if self.exclude_forks:
+            repos = [r for r in repos if not r.get("fork")]
+        return repos
+
+    def analyze_resume(self, url: str) -> dict[str, Any]:
+        """Analyze a resume as supplementary evidence, not as proof of skill."""
+        text = self._download_text_document(url)
+        scores, hits = self._score_text(text, source_type="resume", repository="resume")
+        return {"scores": dict(scores), "keywords": {k: dict(v) for k, v in hits.items()}}
+
+    def analyze_linkedin(self, url: str) -> dict[str, Any]:
+        """Analyze publicly accessible LinkedIn text as supplementary evidence."""
+        if not url:
+            return {"scores": {}, "keywords": {}}
+        try:
+            response = requests.get(
+                url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122 Safari/537.36"
+                },
+                timeout=20,
+            )
+            response.raise_for_status()
+            from bs4 import BeautifulSoup
+            text = BeautifulSoup(response.text, "html.parser").get_text("\n")
+        except Exception as exc:
+            logger.warning("LinkedIn extraction failed: %s", exc)
+            return {"scores": {}, "keywords": {}, "error": str(exc)}
+        scores, hits = self._score_text(text, source_type="linkedin", repository="linkedin")
+        return {"scores": dict(scores), "keywords": {k: dict(v) for k, v in hits.items()}}
+
+    # ------------------------------------------------------------------
+    # Configuration
+    # ------------------------------------------------------------------
+
+    def _load_domain_config(self, config_path: str | None) -> None:
+        path = Path(config_path) if config_path else Path(__file__).with_name("domains.json")
+        if not path.exists():
+            logger.warning("Domain config not found: %s; using dynamic evidence only", path)
+            return
+        with path.open("r", encoding="utf-8") as fh:
+            config = json.load(fh)
+        for name, cfg in config.get("domains", {}).items():
+            libraries = {str(x).lower() for x in cfg.get("libraries", [])}
+            keywords = {str(x).lower() for x in cfg.get("keywords", [])}
+            self.domains[name] = {"libraries": libraries, "keywords": keywords}
+            self.domain_regexes[name] = [
+                (kw, re.compile(r"\b" + re.escape(kw) + r"\b", re.I)) for kw in keywords
+            ]
+
+    # ------------------------------------------------------------------
+    # GitHub API
+    # ------------------------------------------------------------------
+
+    def _api_headers(self) -> dict[str, str]:
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "User-Agent": DEFAULT_USER_AGENT,
+            "X-GitHub-Api-Version": "2026-03-10",
+        }
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        return headers
+
+    def _api_get(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        response = requests.get(
+            DEFAULT_API + path,
+            headers=self._api_headers(),
+            params=params,
+            timeout=30,
+        )
+        if response.status_code == 404:
+            return None
+        if response.status_code == 403:
+            raise RuntimeError("GitHub API access/rate limit error. Supply a token with the required repository access.")
+        response.raise_for_status()
+        return response.json()
+
+    def _paginate(self, path: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+        page = 1
+        output: list[dict[str, Any]] = []
+        while True:
+            page_params = dict(params)
+            page_params["page"] = page
+            data = self._api_get(path, page_params)
+            if not data:
+                break
+            if not isinstance(data, list):
+                break
+            output.extend(data)
+            if len(data) < int(params.get("per_page", 100)):
+                break
+            page += 1
+        return output
+
+    # ------------------------------------------------------------------
+    # Repository analysis
+    # ------------------------------------------------------------------
+
+    def _analyze_repository(self, repo: dict[str, Any]) -> None:
+        full_name = repo["full_name"]
+        logger.info("Scanning entire repository: %s%s", full_name, " [private]" if repo.get("private") else "")
+        root = self._clone_repository(repo)
+        try:
+            insight = RepositoryInsight(
+                name=repo.get("name", ""),
+                full_name=full_name,
+                url=repo.get("html_url", ""),
+                private=bool(repo.get("private")),
+                fork=bool(repo.get("fork")),
+                archived=bool(repo.get("archived")),
+                default_branch=repo.get("default_branch", ""),
+                description=repo.get("description") or "",
+                topics=repo.get("topics") or [],
+                stars=int(repo.get("stargazers_count") or 0),
+                forks=int(repo.get("forks_count") or 0),
+                size_kb=int(repo.get("size") or 0),
+                created_at=repo.get("created_at") or "",
+                updated_at=repo.get("updated_at") or "",
+                pushed_at=repo.get("pushed_at") or "",
+            )
+
+            for topic in insight.topics:
+                self._add_evidence(Evidence(topic, full_name, "repository_topic", evidence=f"GitHub topic: {topic}", strength="medium"))
+
+            all_dependencies: set[str] = set()
+            for path in self._iter_files(root):
+                insight.files_scanned += 1
+                language = LANGUAGE_BY_EXTENSION.get(path.suffix)
+                if language:
+                    insight.source_files_scanned += 1
+                    insight.languages[language] = insight.languages.get(language, 0) + 1
+
+                if path.name in DEPENDENCY_FILES:
+                    all_dependencies.update(self._parse_dependency_file(path))
+
+                if self._is_binary(path) or path.stat().st_size > self.max_file_bytes:
+                    continue
+                text = self._read_text(path)
+                if not text:
+                    continue
+                lines = text.splitlines()
+                insight.lines_scanned += len(lines)
+                self._scan_source_text(full_name, path.relative_to(root).as_posix(), lines)
+
+            insight.dependencies = sorted(all_dependencies)
+            for dep in insight.dependencies:
+                self._record_library_evidence(dep, full_name, "dependency_manifest", "")
+
+            insight.skills = sorted({e.skill for e in self.evidence if e.repository == full_name})
+            if self.scan_history:
+                insight.author_commit_count = self._count_target_commits(full_name)
+
+            self.repositories.append(insight)
+        finally:
+            if not self.keep_clones:
+                shutil.rmtree(root, ignore_errors=True)
+
+    def _clone_repository(self, repo: dict[str, Any]) -> Path:
+        base = self.workdir or Path(tempfile.mkdtemp(prefix="github-profile-analyzer-"))
+        base.mkdir(parents=True, exist_ok=True)
+        target = base / re.sub(r"[^A-Za-z0-9_.-]", "_", repo["full_name"])
+        if target.exists():
+            shutil.rmtree(target, ignore_errors=True)
+
+        env = os.environ.copy()
+        if self.token:
+            # Git supports environment-backed config. The token therefore does
+            # not appear in the clone URL or the command line.
+            env["GIT_CONFIG_COUNT"] = "1"
+            env["GIT_CONFIG_KEY_0"] = "http.extraheader"
+            env["GIT_CONFIG_VALUE_0"] = f"Authorization: Bearer {self.token}"
+
+        command = ["git", "clone", "--recurse-submodules", repo["clone_url"], str(target)]
+        try:
+            subprocess.run(
+                command,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=1800,
+                check=True,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError("Git executable was not found. Install Git and ensure it is on PATH.") from exc
+        except subprocess.CalledProcessError as exc:
+            # Never include environment variables in the error. Git's stderr
+            # can be safely surfaced because the token was not embedded in URL.
+            raise RuntimeError(f"git clone failed for {repo['full_name']}: {exc.stderr[-2000:]}") from exc
+        return target
+
+    def _iter_files(self, root: Path) -> Iterable[Path]:
+        for directory, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRECTORIES]
+            for filename in filenames:
+                yield Path(directory) / filename
+
+    def _is_binary(self, path: Path) -> bool:
+        if path.suffix.lower() in BINARY_EXTENSIONS:
+            return True
+        try:
+            with path.open("rb") as fh:
+                return b"\x00" in fh.read(4096)
+        except OSError:
+            return True
+
+    def _read_text(self, path: Path) -> str:
+        try:
+            return path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            try:
+                return path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                return ""
+        except OSError:
+            return ""
+
+    def _parse_dependency_file(self, path: Path) -> set[str]:
+        name = path.name.lower()
+        text = self._read_text(path)
+        deps: set[str] = set()
+        if name in {"requirements.txt", "pipfile"}:
+            for line in text.splitlines():
+                m = re.match(r"\s*([A-Za-z0-9_.-]+)", line)
+                if m and not line.lstrip().startswith("#"):
+                    deps.add(m.group(1).lower())
+        elif name == "package.json":
+            try:
+                data = json.loads(text)
+                for section in ("dependencies", "devDependencies", "peerDependencies"):
+                    deps.update(str(x).lower() for x in data.get(section, {}))
+            except json.JSONDecodeError:
+                pass
+        elif name in {"cargo.toml", "pyproject.toml", "go.mod", "pom.xml", "composer.json", "pubspec.yaml"}:
+            for line in text.splitlines():
+                for token in re.findall(r"[A-Za-z][A-Za-z0-9_.@/-]{2,}", line):
+                    if token.lower() not in {"true", "false", "version", "name", "dependencies", "require"}:
+                        deps.add(token.lower())
+        else:
+            for line in text.splitlines():
+                token = line.strip().split("==")[0].split(">=")[0].split("@")[0]
+                if token and re.match(r"^[A-Za-z0-9_.-]+$", token):
+                    deps.add(token.lower())
+        return deps
+
+    # ------------------------------------------------------------------
+    # Evidence extraction
+    # ------------------------------------------------------------------
+
+    def _scan_source_text(self, repository: str, relative_path: str, lines: list[str]) -> None:
+        extension = Path(relative_path).suffix.lower()
+        language = LANGUAGE_BY_EXTENSION.get(extension)
+        if language:
+            self._add_evidence(Evidence(language, repository, "source_language", relative_path, evidence=f"{language} source file", strength="medium"))
+
+        for line_no, line in enumerate(lines, start=1):
+            imports = self._extract_imports(line, extension)
+            for library in imports:
+                self._record_library_evidence(library, repository, "code_import", relative_path, line_no)
+
+            for domain, patterns in self.domain_regexes.items():
+                for keyword, pattern in patterns:
+                    if pattern.search(line):
+                        self._add_evidence(Evidence(domain, repository, "source_keyword", relative_path, line_no, line.strip()[:300], "strong"))
+
+            # Dependency/technology names not necessarily present in domains.json
+            for technology in self._detect_known_technologies(line):
+                self._add_evidence(Evidence(technology, repository, "technology_signal", relative_path, line_no, line.strip()[:300], "strong"))
+
+    def _extract_imports(self, line: str, extension: str) -> set[str]:
+        result: set[str] = set()
+        patterns = []
+        if extension in {".py", ".pyw"}:
+            patterns = [r"^\s*import\s+([A-Za-z0-9_]+)", r"^\s*from\s+([A-Za-z0-9_]+)"]
+        elif extension in {".js", ".jsx", ".ts", ".tsx", ".vue", ".svelte"}:
+            patterns = [r"from\s+[\"']([^\"']+)[\"']", r"require\(\s*[\"']([^\"']+)[\"']\s*\)"]
+        elif extension in {".c", ".h", ".cc", ".cpp", ".cxx", ".hpp"}:
+            patterns = [r"^\s*#include\s*[<\"]([^>\"]+)[>\"]"]
+        elif extension in {".java", ".kt", ".kts", ".scala"}:
+            patterns = [r"^\s*import\s+([A-Za-z0-9_.]+)"]
+        elif extension == ".go":
+            patterns = [r"[\"']([^\"']+)[\"']"]
+        for pattern in patterns:
+            for match in re.finditer(pattern, line):
+                value = match.group(1).split("/")[0].lower()
+                if value.startswith("@") and "/" in match.group(1):
+                    parts = match.group(1).split("/")
+                    value = "/".join(parts[:2]).lower()
+                if value and len(value) > 1:
+                    result.add(value)
+        return result
+
+    def _record_library_evidence(self, library: str, repository: str, source_type: str, path: str, line: int | None = None) -> None:
+        normalized = library.lower().strip()
+        for domain, cfg in self.domains.items():
+            if normalized in cfg.get("libraries", set()):
+                self._add_evidence(Evidence(domain, repository, source_type, path, line, f"Library/dependency: {library}", "strong"))
+
+    def _detect_known_technologies(self, line: str) -> set[str]:
+        # These are intentionally additive; domains.json remains the main
+        # configurable taxonomy.
+        known = {
+            "pytorch": "PyTorch", "tensorflow": "TensorFlow", "keras": "Keras",
+            "scikit-learn": "scikit-learn", "sklearn": "scikit-learn", "pandas": "Pandas",
+            "numpy": "NumPy", "scipy": "SciPy", "qiskit": "Qiskit", "cirq": "Cirq",
+            "pennylane": "PennyLane", "cuda": "CUDA", "docker": "Docker",
+            "kubernetes": "Kubernetes", "terraform": "Terraform", "aws": "AWS",
+            "azure": "Azure", "gcp": "Google Cloud", "fastapi": "FastAPI",
+            "django": "Django", "flask": "Flask", "react": "React", "next.js": "Next.js",
+            "langchain": "LangChain", "transformers": "Hugging Face Transformers",
+            "opencv": "OpenCV", "spark": "Apache Spark", "pyspark": "PySpark",
+        }
+        lower = line.lower()
+        return {label for token, label in known.items() if re.search(r"\b" + re.escape(token) + r"\b", lower)}
+
+    def _add_evidence(self, evidence: Evidence) -> None:
+        # Avoid exploding the report with identical repeated observations.
+        key = (evidence.skill, evidence.repository, evidence.source_type, evidence.path, evidence.line, evidence.evidence)
+        if not hasattr(self, "_evidence_keys"):
+            self._evidence_keys: set[tuple[Any, ...]] = set()
+        if key not in self._evidence_keys:
+            self._evidence_keys.add(key)
+            self.evidence.append(evidence)
+
+    # ------------------------------------------------------------------
+    # Git history and scoring
+    # ------------------------------------------------------------------
+
+    def _count_target_commits(self, repository: str) -> int:
+        """Count commits attributed to the target GitHub login where possible."""
+        data = self._api_get(f"/repos/{repository}/commits", {"author": self.username, "per_page": 100})
+        if not isinstance(data, list):
+            return 0
+        # Pagination is intentionally limited here: the number is an evidence
+        # signal, not a complete contribution ledger.
+        return len(data)
+
+    def _score_domains(self) -> dict[str, int]:
+        scores = Counter()
+        for evidence in self.evidence:
+            if evidence.skill not in self.domains:
+                continue
+            weight = {
+                "code_import": 10,
+                "dependency_manifest": 10,
+                "source_keyword": 3,
+                "repository_topic": 5,
+                "technology_signal": 8,
+                "source_language": 1,
+            }.get(evidence.source_type, 1)
+            scores[evidence.skill] += weight
+        return {domain: int(scores.get(domain, 0)) for domain in self.domains}
+
+    def _build_skill_insights(self, domain_scores: dict[str, int]) -> list[dict[str, Any]]:
+        counts = Counter(e.skill for e in self.evidence)
+        output = []
+        for skill, count in counts.most_common():
+            skill_evidence = [e for e in self.evidence if e.skill == skill]
+            output.append({
+                "skill": skill,
+                "evidence_count": count,
+                "confidence": self._confidence(skill_evidence),
+                "proof": [asdict(e) for e in skill_evidence[:25]],
+            })
+        return output
+
+    def _confidence(self, evidence: list[Evidence]) -> str:
+        strong = sum(1 for e in evidence if e.strength == "strong")
+        imports = sum(1 for e in evidence if e.source_type in {"code_import", "dependency_manifest"})
+        repos = len({e.repository for e in evidence})
+        if imports >= 3 and repos >= 2:
+            return "high"
+        if imports >= 1 or strong >= 3:
+            return "medium"
+        return "low"
+
+    def _language_counts(self) -> Counter:
+        counter = Counter()
+        for repo in self.repositories:
+            counter.update(repo.languages)
+        return counter
+
+    def _library_counts(self) -> Counter:
+        counter = Counter()
+        for evidence in self.evidence:
+            if evidence.source_type in {"code_import", "dependency_manifest"}:
+                counter[evidence.evidence.replace("Library/dependency: ", "")] += 1
+        return counter
+
+    def _build_general_insights(self, user: dict[str, Any]) -> dict[str, Any]:
+        active = [r for r in self.repositories if not r.archived]
+        recent = sorted(active, key=lambda r: r.pushed_at or "", reverse=True)[:10]
+        total_lines = sum(r.lines_scanned for r in self.repositories)
+        return {
+            "active_repositories": len(active),
+            "archived_repositories": len(self.repositories) - len(active),
+            "total_source_files_scanned": sum(r.source_files_scanned for r in self.repositories),
+            "total_text_lines_scanned": total_lines,
+            "most_recent_repositories": [r.full_name for r in recent],
+            "largest_repositories_by_scanned_files": [
+                r.full_name for r in sorted(self.repositories, key=lambda x: x.files_scanned, reverse=True)[:10]
+            ],
+            "private_access_note": (
+                "Private repositories were included only when the supplied GitHub token had access to them."
+                if self.token else
+                "No token supplied; analysis is limited to publicly accessible repositories."
+            ),
+            "interpretation_note": (
+                "Skills are inferred from repository/code evidence. Repository ownership alone is not treated as proof of authorship."
+            ),
         }
 
-    IMPORTANT_THRESHOLDS = config.get("important_repo_thresholds", IMPORTANT_THRESHOLDS)
+    # ------------------------------------------------------------------
+    # Resume helpers
+    # ------------------------------------------------------------------
 
-    DOMAIN_REGEXES = {}
-    for domain, cfg in DOMAINS.items():
-        patterns = []
-        for kw in cfg["keywords"]:
-            pattern = re.compile(r'\b' + re.escape(kw) + r'\b', re.IGNORECASE)
-            patterns.append((kw, pattern))
-        DOMAIN_REGEXES[domain] = patterns
-
-    domain_names = ", ".join(DOMAINS.keys())
-    print(f"[Config] Loaded {len(DOMAINS)} domains: {domain_names}")
-
-
-# ===================================================================
-# GitHub API helpers
-# ===================================================================
-
-def get_repos(username: str, token: str | None = None) -> list[dict]:
-    """Fetches all repositories from GitHub API."""
-    repos: list[dict] = []
-    page = 1
-    while True:
-        url = f"https://api.github.com/users/{username}/repos?per_page=100&page={page}"
-        req = urllib.request.Request(url, headers=HEADERS)
-        if token:
-            req.add_header("Authorization", f"token {token}")
-        try:
-            with urllib.request.urlopen(req) as response:
-                data = json.loads(response.read().decode())
-                if not data:
-                    break
-                repos.extend(data)
-                if len(data) < 100:
-                    break
-                page += 1
-        except urllib.error.HTTPError as e:
-            print(f"Error fetching repos from GitHub API: {e}", file=sys.stderr)
-            if e.code == 403:
-                print("Rate limit exceeded. Try providing a token with --token.", file=sys.stderr)
-            return []
-        except Exception as e:
-            print(f"Failed to connect to GitHub API: {e}", file=sys.stderr)
-            return []
-    return repos
-
-
-def get_repo_topics(username: str, repo_name: str, token: str | None = None) -> list[str]:
-    """Fetches topics/tags for a specific repository from GitHub API."""
-    url = f"https://api.github.com/repos/{username}/{repo_name}/topics"
-    headers_with_preview = dict(HEADERS)
-    headers_with_preview["Accept"] = "application/vnd.github.mercy-preview+json"
-    req = urllib.request.Request(url, headers=headers_with_preview)
-    if token:
-        req.add_header("Authorization", f"token {token}")
-    try:
-        with urllib.request.urlopen(req, timeout=10) as response:
-            data = json.loads(response.read().decode())
-            return data.get("names", [])
-    except Exception:
-        return []
-
-
-# ===================================================================
-# Resume / LinkedIn text extraction
-# ===================================================================
-
-def extract_text_from_gdrive_resume(url: str) -> str:
-    """Downloads a resume from a Google Drive sharing link and handles raw text or PDFs."""
-    if not url:
-        return ""
-    print(f"[Resume] Detecting Google Drive target asset link...")
-
-    # Extract structural unique file ID from common share URLs
-    match = re.search(r'/d/([a-zA-Z0-9-_]+)', url)
-    if not match:
-        match = re.search(r'id=([a-zA-Z0-9-_]+)', url)
-
-    if not match:
-        print("[Warning] Could not extract valid Google Drive Document ID from target string.", file=sys.stderr)
-        return ""
-
-    file_id = match.group(1)
-    direct_download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
-
-    req = urllib.request.Request(direct_download_url, headers={"User-Agent": "Mozilla/5.0"})
-    try:
-        with urllib.request.urlopen(req) as response:
-            file_payload = response.read()
-
-        # Programmatic determination if payload is raw binary PDF binary data
-        if file_payload.startswith(b'%PDF'):
+    def _download_text_document(self, url: str) -> str:
+        if not url:
+            return ""
+        response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+        response.raise_for_status()
+        payload = response.content
+        if payload.startswith(b"%PDF"):
             try:
                 import pypdf
-            except ImportError:
-                print("[Dependency Error] File verified as PDF format, but 'pypdf' package is missing.", file=sys.stderr)
-                print("Run command: 'pip install pypdf' to automatically analyze resumes.", file=sys.stderr)
+                import io
+                reader = pypdf.PdfReader(io.BytesIO(payload))
+                return "\n".join(page.extract_text() or "" for page in reader.pages)
+            except Exception:
                 return ""
+        return response.text
 
-            with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
-                tmp_file.write(file_payload)
-                tmp_filename = tmp_file.name
+    def _score_text(self, text: str, source_type: str, repository: str) -> tuple[Counter, defaultdict[str, Counter]]:
+        scores = Counter()
+        hits: defaultdict[str, Counter] = defaultdict(Counter)
+        for line_no, line in enumerate(text.splitlines(), 1):
+            for domain, patterns in self.domain_regexes.items():
+                for keyword, pattern in patterns:
+                    if pattern.search(line):
+                        scores[domain] += 3
+                        hits[domain][keyword] += 1
+                        self._add_evidence(Evidence(domain, repository, source_type, line=line_no, evidence=line.strip()[:300], strength="low"))
+        return scores, hits
 
-            extracted_text = ""
-            try:
-                pdf_reader = pypdf.PdfReader(tmp_filename)
-                for page in pdf_reader.pages:
-                    extracted_text += page.extract_text() or ""
-            finally:
-                os.remove(tmp_filename)
-            print(f"[Resume] Extracted {len(extracted_text)} bytes of descriptive text from PDF document.")
-            return extracted_text
-        else:
-            return file_payload.decode('utf-8', errors='ignore')
-    except Exception as err:
-        print(f"[Warning] Handshake or parse pipeline failed for document link: {err}", file=sys.stderr)
-        return ""
+    @staticmethod
+    def _normalise_username(username: str) -> str:
+        value = username.strip().rstrip("/")
+        value = re.sub(r"^https?://github\.com/", "", value, flags=re.I)
+        return value.split("/")[0].strip()
 
-
-def extract_text_from_linkedin(url: str) -> str:
-    """Fetches public LinkedIn profile content and strips basic HTML tags."""
-    if not url:
-        return ""
-    print(f"[LinkedIn] Requesting target public interface profile data...")
-
-    browser_headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5"
-    }
-    req = urllib.request.Request(url, headers=browser_headers)
-    try:
-        with urllib.request.urlopen(req, timeout=15) as response:
-            html_raw = response.read().decode('utf-8', errors='ignore')
-        # Filter raw HTML syntax down to single block structures
-        filtered_text = re.sub(r'<[^>]+>', ' ', html_raw)
-        return filtered_text
-    except urllib.error.HTTPError as err:
-        print(f"[Warning] Security verification returned HTTP Status {err.code}. Anti-scraping gates active.", file=sys.stderr)
-        return ""
-    except Exception as err:
-        print(f"[Warning] Intermittent connection drop reading network link: {err}", file=sys.stderr)
-        return ""
-
-
-# ===================================================================
-# Scoring / taxonomy helpers
-# ===================================================================
-
-def score_text_by_taxonomy(text: str) -> tuple[Counter, defaultdict]:
-    """Scans standalone text strings using global domain taxonomy engine rules."""
-    text_scores: Counter = Counter()
-    text_keywords: defaultdict = defaultdict(Counter)
-    if not text:
-        return text_scores, text_keywords
-
-    text_lines = text.split('\n')
-    for line in text_lines:
-        for domain, matching_patterns in DOMAIN_REGEXES.items():
-            for keyword, compiled_regex in matching_patterns:
-                if compiled_regex.search(line):
-                    text_keywords[domain][keyword] += 1
-                    text_scores[domain] += 3  # Assigned keyword weight for curated artifacts
-    return text_scores, text_keywords
-
-
-def collect_discovered_items(
-    discovered_topics: Counter,
-    all_unmatched_imports: Counter,
-) -> list[list]:
-    """Identifies libraries and keywords not yet covered by the domain taxonomy."""
-    all_known_libs: set[str] = set()
-    all_known_kws: set[str] = set()
-    for cfg in DOMAINS.values():
-        all_known_libs.update(cfg.get("libraries", set()))
-        all_known_kws.update(cfg.get("keywords", set()))
-
-    stdlib_modules = {
-        "os", "sys", "re", "json", "math", "random", "time", "datetime", "collections",
-        "itertools", "functools", "pathlib", "typing", "abc", "io", "copy", "string",
-        "hashlib", "logging", "argparse", "subprocess", "threading", "multiprocessing",
-        "socket", "http", "urllib", "email", "html", "xml", "csv", "sqlite3", "pickle",
-        "struct", "enum", "dataclasses", "contextlib", "warnings", "traceback", "inspect",
-        "ast", "dis", "gc", "ctypes", "platform", "shutil", "glob", "tempfile",
-        "textwrap", "pprint", "operator", "decimal", "fractions", "statistics",
-        "unittest", "doctest", "pdb", "profile", "timeit", "array", "queue",
-        "heapq", "bisect", "weakref", "types", "codecs", "locale", "gettext",
-        "secrets", "hmac", "base64", "binascii", "uuid", "ipaddress",
-        "configparser", "zipfile", "tarfile", "gzip", "bz2", "lzma",
-        "signal", "mmap", "select", "selectors", "asyncio", "concurrent",
-        "test", "__future__", "importlib", "pkgutil", "setuptools", "pip",
-        "site", "sysconfig", "distutils", "venv", "ensurepip",
-        "app", "config", "settings", "models", "views", "urls", "forms",
-        "utils", "helpers", "constants", "exceptions", "tests", "main",
-        "setup", "manage", "conftest", "fixtures", "migrations"
-    }
-
-    discovered: list[list] = []
-    for lib, count in all_unmatched_imports.most_common():
-        if (count >= 2 and lib not in stdlib_modules and lib not in all_known_libs
-                and not lib.startswith("_") and len(lib) > 1):
-            discovered.append(["Library", lib, count])
-
-    for topic, count in discovered_topics.most_common():
-        topic_lower = topic.lower().replace("-", " ")
-        if topic_lower not in all_known_kws and topic_lower not in stdlib_modules:
-            discovered.append(["Keyword", topic_lower, count])
-
-    return discovered
-
-
-# ===================================================================
-# File scanning helpers
-# ===================================================================
-
-def is_binary(file_path: str) -> bool:
-    """Return True if *file_path* appears to be a binary file."""
-    _, ext = os.path.splitext(file_path)
-    if ext.lower() in BINARY_EXTENSIONS:
-        return True
-    try:
-        with open(file_path, 'rb') as f:
-            chunk = f.read(1024)
-            return b'\x00' in chunk
-    except Exception:
-        return True
-
-
-def extract_python_imports(line: str) -> str | None:
-    """Extract the top-level module name from a Python import statement."""
-    m1 = re.match(r'^\s*import\s+([a-zA-Z0-9_]+)', line)
-    if m1:
-        return m1.group(1).lower()
-    m2 = re.match(r'^\s*from\s+([a-zA-Z0-9_]+)', line)
-    if m2:
-        return m2.group(1).lower()
-    return None
-
-
-def extract_js_imports(line: str) -> str | None:
-    """Extract the top-level package name from a JS/TS import or require()."""
-    m1 = re.search(r'from\s+[\'"]([^\'\"]+)[\'"]', line)
-    if m1:
-        pkg = m1.group(1)
-        if pkg.startswith('@'):
-            parts = pkg.split('/')
-            return '/'.join(parts[:2]).lower() if len(parts) >= 2 else pkg.lower()
-        return pkg.split('/')[0].lower()
-    m2 = re.search(r'require\(\s*[\'"]([^\'\"]+)[\'"]\s*\)', line)
-    if m2:
-        pkg = m2.group(1)
-        if pkg.startswith('@'):
-            parts = pkg.split('/')
-            return '/'.join(parts[:2]).lower() if len(parts) >= 2 else pkg.lower()
-        return pkg.split('/')[0].lower()
-    return None
-
-
-def extract_cpp_includes(line: str) -> str | None:
-    """Extract the header / library name from a C/C++ #include directive."""
-    m = re.match(r'^\s*#include\s*[<"]([^>"]+)[>"]', line)
-    if m:
-        header = m.group(1)
-        return header.split('/')[0].lower()
-    return None
-
-
-def parse_dependency_file(file_path: str, filename: str) -> set[str]:
-    """Parse known dependency manifests and return the set of library names."""
-    libs: set[str] = set()
-    try:
-        if filename == "requirements.txt":
-            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith('#'):
-                        continue
-                    m = re.match(r'^([a-zA-Z0-9_-]+)', line)
-                    if m:
-                        libs.add(m.group(1).lower())
-        elif filename == "package.json":
-            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                data = json.load(f)
-                for dep_type in ["dependencies", "devDependencies"]:
-                    if dep_type in data:
-                        for dep in data[dep_type]:
-                            libs.add(dep.lower())
-        elif filename == "Cargo.toml":
-            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                in_deps = False
-                for line in f:
-                    line = line.strip()
-                    if line.startswith('[dependencies]') or line.startswith('[dev-dependencies]'):
-                        in_deps = True
-                        continue
-                    elif line.startswith('[') and in_deps:
-                        in_deps = False
-                    if in_deps and '=' in line:
-                        m = re.match(r'^([a-zA-Z0-9_-]+)', line)
-                        if m:
-                            libs.add(m.group(1).lower())
-    except Exception:
-        pass
-    return libs
-
-
-def parse_ipynb(file_path: str) -> tuple[list[str], list[str]]:
-    """Extract code and markdown lines from a Jupyter notebook file."""
-    code_lines: list[str] = []
-    markdown_lines: list[str] = []
-    try:
-        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            notebook = json.load(f)
-            cells = notebook.get("cells", [])
-            for cell in cells:
-                cell_type = cell.get("cell_type")
-                source = cell.get("source", [])
-                if isinstance(source, str):
-                    source = [source]
-                if cell_type == "code":
-                    code_lines.extend(source)
-                elif cell_type == "markdown":
-                    markdown_lines.extend(source)
-    except Exception:
-        pass
-    return code_lines, markdown_lines
-
-
-def clean_dir(dir_path: str) -> None:
-    """Force-remove a directory tree, handling read-only files on Windows."""
-    if not os.path.exists(dir_path):
-        return
-    for root, dirs, files in os.walk(dir_path, topdown=False):
-        for name in files:
-            file_path = os.path.join(root, name)
-            try:
-                os.chmod(file_path, stat.S_IWRITE)
-                os.remove(file_path)
-            except Exception:
-                pass
-        for name in dirs:
-            dir_path_sub = os.path.join(root, name)
-            try:
-                os.chmod(dir_path_sub, stat.S_IWRITE)
-                os.rmdir(dir_path_sub)
-            except Exception:
-                pass
-    try:
-        shutil.rmtree(dir_path)
-    except Exception:
-        pass
-
-
-# ===================================================================
-# Input normalization helpers
-# ===================================================================
-
-def normalize_github_input(value: str) -> str | None:
-    """Normalize a GitHub username or profile URL to a plain username.
-
-    Accepts raw usernames, ``@user`` handles, or full ``github.com/`` URLs.
-    Returns ``None`` for empty / blank input.
-    """
-    if not value:
-        return None
-    value = value.strip()
-    if 'github.com/' in value:
-        return value.split('github.com/')[-1].split('/')[0]
-    return value.replace('@', '').strip('/')
-
-
-def normalize_linkedin_input(value: str) -> str | None:
-    """Normalize a LinkedIn identifier to a full profile URL.
-
-    If *value* already contains ``linkedin.com/`` it is returned as-is.
-    Otherwise it is treated as a vanity slug and wrapped in the canonical URL.
-    Returns ``None`` for empty / blank input.
-    """
-    if not value:
-        return None
-    value = value.strip()
-    if 'linkedin.com/' in value:
-        return value
-    value = value.replace('@', '').strip('/')
-    return f'https://www.linkedin.com/in/{value}/'
-
-
-# ===================================================================
-# Core analysis pipeline
-# ===================================================================
-
-
-def is_repo_url(url: str) -> bool:
-    import urllib.parse
-    parsed = urllib.parse.urlparse(url)
-    parts = [p for p in parsed.path.split('/') if p]
-    return len(parts) >= 2
-
-def score_repo_for_domain(repo_name: str, topics: list[str], domain: str) -> int:
-    score = 0
-    text = (repo_name + " " + " ".join(topics)).lower()
-    if domain == "Quantum Technology":
-        if any(x in text for x in ['qiskit', 'quantum', 'qml', 'cirq', 'pennylane']): score += 10
-    elif domain == "ML/DL/DS/AI":
-        if any(x in text for x in ['ml', 'ai', 'deep', 'learning', 'data', 'neural']): score += 10
-    return score
-
-def process_github_input(val: str, domain_focus: str, token: str) -> tuple[str, list[dict]]:
-    if not val or len(val.strip()) == 0:
-        return "", []
-        
-    val = val.strip()
-    
-    # If it's pure text description
-    if "github.com" not in val and (" " in val or len(val) > 40):
-        return val, []
-
-    # If it's a github URL
-    if "github.com" in val:
-        # Check if it's a direct repo (github.com/user/repo)
-        path = val.split("github.com/")[-1].split("/")
-        if len(path) >= 2 and path[1].strip():
-            user = path[0].strip()
-            repo = path[1].strip()
-            # Clean up repo name (remove .git etc)
-            if repo.endswith(".git"): repo = repo[:-4]
-            return "", [{"name": repo, "clone_url": f"https://github.com/{user}/{repo}.git"}]
-            
-    # It's a profile URL or username
-    username = normalize_github_input(val) or val
-    repos = get_repos(username, token)
-    repos = [r for r in repos if not r.get("fork", False)]
-    
-    # Score repos for this domain
-    scored_repos = []
-    for r in repos:
-        topics = get_repo_topics(username, r["name"], token)
-        s = score_repo_for_domain(r["name"], topics, domain_focus)
-        scored_repos.append((s, r))
-    
-    scored_repos.sort(key=lambda x: x[0], reverse=True)
-    # Return top 2 repos
-    return "", [x[1] for x in scored_repos[:2]]
 
 def analyze_candidate(
-    classical_github: str = "",
-    quantum_github: str = "",
+    username: str,
+    token: str | None = None,
     resume_url: str | None = None,
     linkedin_url: str | None = None,
-    token: str | None = None,
     config_path: str | None = None,
+    **kwargs: Any,
 ) -> dict[str, Any]:
-    """Run the full candidate-screening pipeline and return structured results.
-
-    Parameters
-    ----------
-    github_username:
-        GitHub username or profile URL.
-    resume_url:
-        Optional Google Drive link to a résumé (PDF or plain text).
-    linkedin_url:
-        Optional public LinkedIn profile URL.
-    token:
-        GitHub Personal Access Token.  Falls back to the ``GITHUB_TOKEN``
-        environment variable when *None*.
-    config_path:
-        Path to the domain taxonomy JSON config.  Defaults to
-        ``domains.json`` next to this script.
-    exclude_forks:
-        When *True*, forked repositories are excluded from analysis.
-
-    Returns
-    -------
-    dict
-        A dictionary containing all analysis results (scores, languages,
-        libraries, keywords, per-repo breakdowns, etc.).
-    """
-
-    # -- Resolve config & load taxonomy (idempotent guard) ----------------
-    if not DOMAINS:
-        resolved_config = config_path or os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "domains.json"
-        )
-        load_domain_config(resolved_config)
-
-    # -- Normalize inputs -------------------------------------------------
-    resume_url = resume_url.strip() if resume_url else None
-    linkedin_url = normalize_linkedin_input(linkedin_url) if linkedin_url else None
-
-    # -- Resolve token (never hardcoded) ----------------------------------
-    token = token or os.getenv('GITHUB_TOKEN')
-
-    # -- Core profile-level accumulators ----------------------------------
-    profile_languages: Counter = Counter()
-    profile_libraries: defaultdict = defaultdict(set)
-    profile_keywords: defaultdict = defaultdict(Counter)
-    profile_domain_scores: Counter = Counter()
-
-    resume_scores: Counter = Counter()
-    resume_keywords: defaultdict = defaultdict(Counter)
-    linkedin_scores: Counter = Counter()
-    linkedin_keywords: defaultdict = defaultdict(Counter)
-
-    # -- 1. Resume Analysis Context ---------------------------------------
+    """Backward-compatible functional wrapper around ``GitHubProfileAnalyzer``."""
+    analyzer = GitHubProfileAnalyzer(username, token=token, config_path=config_path, **kwargs)
+    result = analyzer.analyze()
     if resume_url:
-        resume_text = extract_text_from_gdrive_resume(resume_url)
-        if resume_text:
-            resume_scores, resume_keywords = score_text_by_taxonomy(resume_text)
-            profile_domain_scores.update(resume_scores)
-            for d in DOMAINS:
-                profile_keywords[d].update(resume_keywords[d])
-
-    # -- 2. LinkedIn Profile Context --------------------------------------
+        result["resume"] = analyzer.analyze_resume(resume_url)
     if linkedin_url:
-        linkedin_text = extract_text_from_linkedin(linkedin_url)
-        if linkedin_text:
-            linkedin_scores, linkedin_keywords = score_text_by_taxonomy(linkedin_text)
-            profile_domain_scores.update(linkedin_scores)
-            for d in DOMAINS:
-                profile_keywords[d].update(linkedin_keywords[d])
+        result["linkedin"] = analyzer.analyze_linkedin(linkedin_url)
+    return result
 
-    # -- 3. GitHub Mining Engine (Classical + Quantum) --------------------
-    repos = []
-    
-    # Classical
-    c_text, c_repos = process_github_input(classical_github, "Software Engineering", token)
-    if c_text:
-        c_scores, c_kws = score_text_by_taxonomy(c_text)
-        profile_domain_scores.update(c_scores)
-        for d in DOMAINS: profile_keywords[d].update(c_kws[d])
-    repos.extend(c_repos)
-    
-    # Quantum
-    q_text, q_repos = process_github_input(quantum_github, "Quantum Technology", token)
-    if q_text:
-        q_scores, q_kws = score_text_by_taxonomy(q_text)
-        profile_domain_scores.update(q_scores)
-        for d in DOMAINS: profile_keywords[d].update(q_kws[d])
-    repos.extend(q_repos)
-
-    # Deduplicate repos
-    seen_urls = set()
-    unique_repos = []
-    for r in repos:
-        if r['clone_url'] not in seen_urls:
-            unique_repos.append(r)
-            seen_urls.add(r['clone_url'])
-    repos = unique_repos
-    
-    print(f"Found {len(repos)} optimal repositories to process.")
-    username = "candidate"  # placeholder since we use direct repo links now
-
-    repo_analyses: list[dict] = []
-
-    all_unmatched_imports: Counter = Counter()
-    all_discovered_topics: Counter = Counter()
-    global_start_time = time.time()
-
-    if repos:
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_root:
-            for idx, repo in enumerate(repos, 1):
-                if time.time() - global_start_time > 60 * 60:
-                    print(f"\n[Warning] Global timeout of 60 minutes reached.")
-                    break
-                repo_name = repo["name"]
-                is_fork = repo.get("fork", False)
-                clone_url = repo["clone_url"]
-                if token:
-                    clone_url = clone_url.replace("https://", f"https://{token}@")
-
-                repo_topics = get_repo_topics(username, repo_name, token)
-                for topic in repo_topics:
-                    all_discovered_topics[topic.lower()] += 1
-
-                print(f"[{idx}/{len(repos)}] Analyzing: {repo_name}...", end="", flush=True)
-
-                repo_temp_path = os.path.join(temp_root, repo_name)
-                clone_success = False
-                env = os.environ.copy()
-                env["GIT_TERMINAL_PROMPT"] = "0"
-                env["GIT_ASKPASS"] = "echo"  # Prevent GUI prompt on Windows
-
-                for attempt in range(1, 3):
-                    if os.path.exists(repo_temp_path):
-                        clean_dir(repo_temp_path)
-                    try:
-                        subprocess.run(
-                            ["git", "clone", "-c", "credential.helper=", "--depth", "1", clone_url, repo_temp_path],
-                            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                            env=env, timeout=15
-                        )
-                        clone_success = True
-                        break
-                    except subprocess.TimeoutExpired:
-                        if attempt < 2:
-                            print(f"\n[Warning] Clone timed out for {repo_name}, retrying...")
-                            time.sleep(2)
-                        continue
-                    except subprocess.CalledProcessError:
-                        break
-
-                if not clone_success:
-                    print(" -> FAILED")
-                    continue
-
-                repo_languages: Counter = Counter()
-                repo_libraries: defaultdict = defaultdict(set)
-                repo_keywords: defaultdict = defaultdict(Counter)
-                repo_domain_scores: Counter = Counter()
-
-                ignored_folders = {
-                    '.git', 'node_modules', 'venv', '.venv', 'env', '.env', 'target',
-                    'dist', 'build', 'out', '.next', '.nuxt', '__pycache__', '.idea',
-                    '.vscode', 'bower_components', 'tmp', 'temp'
-                }
-
-                for root, dirs, files in os.walk(repo_temp_path):
-                    dirs[:] = [d for d in dirs if d.lower() not in ignored_folders]
-
-                    for file in files:
-                        file_path = os.path.join(root, file)
-                        filename = os.path.basename(file)
-                        _, ext = os.path.splitext(file)
-                        ext = ext.lower() if ext else "no_extension"
-
-                        lang_map = {
-                            ".py": "Python", ".ipynb": "Jupyter Notebook",
-                            ".cpp": "C++", ".cc": "C++", ".cxx": "C++", ".h": "C++", ".hpp": "C++",
-                            ".js": "JavaScript", ".jsx": "JavaScript",
-                            ".ts": "TypeScript", ".tsx": "TypeScript",
-                            ".go": "Go", ".rs": "Rust", ".java": "Java",
-                            ".kt": "Kotlin", ".swift": "Swift", ".rb": "Ruby",
-                            ".cs": "C#", ".sh": "Shell", ".md": "Markdown"
-                        }
-                        lang = lang_map.get(ext)
-                        if lang:
-                            repo_languages[lang] += 1
-
-                        dep_libs = parse_dependency_file(file_path, filename)
-                        if dep_libs:
-                            for lib in dep_libs:
-                                matched = False
-                                for domain, config in DOMAINS.items():
-                                    if lib in config["libraries"]:
-                                        repo_libraries[domain].add(lib)
-                                        repo_domain_scores[domain] += 10
-                                        matched = True
-                                if not matched:
-                                    all_unmatched_imports[lib] += 1
-
-                        content_lines: list[str] = []
-                        markdown_lines: list[str] = []
-
-                        file_size = os.path.getsize(file_path)
-                        if file_size <= 1.5 * 1024 * 1024:
-                            if ext == ".ipynb":
-                                content_lines, markdown_lines = parse_ipynb(file_path)
-                            elif not is_binary(file_path):
-                                for encoding in ['utf-8', 'latin-1']:
-                                    try:
-                                        with open(file_path, 'r', encoding=encoding, errors='ignore') as f:
-                                            content_lines = f.readlines()
-                                        break
-                                    except Exception:
-                                        continue
-
-                        file_keywords: defaultdict = defaultdict(set)
-
-                        for line in content_lines:
-                            imp = None
-                            if ext == ".py" or ext == ".ipynb":
-                                imp = extract_python_imports(line)
-                            elif ext in [".js", ".jsx", ".ts", ".tsx"]:
-                                imp = extract_js_imports(line)
-                            elif ext in [".cpp", ".cc", ".cxx", ".h", ".hpp"]:
-                                imp = extract_cpp_includes(line)
-
-                            if imp:
-                                matched = False
-                                for domain, config in DOMAINS.items():
-                                    if imp in config["libraries"]:
-                                        repo_libraries[domain].add(imp)
-                                        repo_domain_scores[domain] += 5
-                                        matched = True
-                                if not matched:
-                                    all_unmatched_imports[imp] += 1
-
-                            for domain, patterns in DOMAIN_REGEXES.items():
-                                for kw, pattern in patterns:
-                                    if pattern.search(line):
-                                        file_keywords[domain].add(kw)
-
-                        for line in markdown_lines:
-                            for domain, patterns in DOMAIN_REGEXES.items():
-                                for kw, pattern in patterns:
-                                    if pattern.search(line):
-                                        file_keywords[domain].add(kw)
-
-                        for domain, kws in file_keywords.items():
-                            for kw in kws:
-                                repo_keywords[domain][kw] += 1
-                                repo_domain_scores[domain] += 1
-
-                clean_dir(repo_temp_path)
-                print(" -> DONE")
-
-                profile_languages.update(repo_languages)
-                profile_domain_scores.update(repo_domain_scores)
-                for d in DOMAINS:
-                    profile_libraries[d].update(repo_libraries[d])
-                    profile_keywords[d].update(repo_keywords[d])
-
-                primary_domain = "General Software Engineering"
-                max_score = 0
-                if repo_domain_scores:
-                    primary_domain, max_score = repo_domain_scores.most_common(1)[0]
-                    if max_score < 5:
-                        primary_domain = "General Software Engineering"
-
-                repo_analyses.append({
-                    "name": repo_name, "fork": is_fork, "languages": repo_languages,
-                    "libraries": {d: list(libs) for d, libs in repo_libraries.items() if libs},
-                    "keywords": {d: [kw for kw, _ in kws.most_common(5)] for d, kws in repo_keywords.items() if kws},
-                    "scores": dict(repo_domain_scores), "primary_domain": primary_domain, "max_score": max_score
-                })
-
-        all_domains = list(DOMAINS.keys())
-        repo_analyses.sort(key=lambda r: sum(r["scores"].get(d, 0) for d in all_domains), reverse=True)
-
-    # -- Derive overall primary domain ------------------------------------
-    primary_domain = "General Software Engineering"
-    if profile_domain_scores:
-        top_domain, top_score = profile_domain_scores.most_common(1)[0]
-        if top_score >= IMPORTANT_THRESHOLDS.get("default_min_score", 5):
-            primary_domain = top_domain
-
-    # -- Discovered items -------------------------------------------------
-    discovered_items = collect_discovered_items(all_discovered_topics, all_unmatched_imports)
-
-    # -- Assemble return dict ---------------------------------------------
-    return {
-        'username': username,
-        'domain_scores': dict(profile_domain_scores),
-        'languages': dict(profile_languages),
-        'libraries': {d: list(libs) for d, libs in profile_libraries.items()},
-        'keywords': {d: dict(kws) for d, kws in profile_keywords.items()},
-        'resume_scores': dict(resume_scores),
-        'linkedin_scores': dict(linkedin_scores),
-        'resume_keywords': {d: dict(kws) for d, kws in resume_keywords.items()},
-        'linkedin_keywords': {d: dict(kws) for d, kws in linkedin_keywords.items()},
-        'repo_analyses': repo_analyses,
-        'repos_scanned': len(repos),
-        'resume_evaluated': bool(resume_url),
-        'linkedin_screened': bool(linkedin_url),
-        'primary_domain': primary_domain,
-        'total_score': sum(profile_domain_scores.values()),
-        'discovered_items': discovered_items,
-    }
-
-
-# ===================================================================
-# Report generation
-# ===================================================================
-
-def write_report(results: dict, output_path: str) -> None:
-    """Write a human-readable text report from *results* to *output_path*.
-
-    Parameters
-    ----------
-    results:
-        The dictionary returned by :func:`analyze_candidate`.
-    output_path:
-        Filesystem path for the output report file.
-    """
-    username = results['username']
-
-    # Reconstruct Counter / defaultdict views needed for formatting
-    profile_domain_scores = Counter(results['domain_scores'])
-    profile_languages = Counter(results['languages'])
-    profile_libraries: dict[str, list] = results['libraries']
-    profile_keywords: dict[str, dict] = results['keywords']
-    resume_scores = Counter(results['resume_scores'])
-    linkedin_scores = Counter(results['linkedin_scores'])
-    resume_keywords: dict[str, dict] = results.get('resume_keywords', {})
-    linkedin_keywords: dict[str, dict] = results.get('linkedin_keywords', {})
-    repo_analyses: list[dict] = results['repo_analyses']
-    repos_scanned: int = results['repos_scanned']
-    resume_evaluated: bool = results['resume_evaluated']
-    linkedin_screened: bool = results['linkedin_screened']
-
-    print(f"Writing integrated structural analytics report to: {output_path}...")
-    with open(output_path, 'w', encoding='utf-8') as f:
-        f.write("=" * 80 + "\n")
-        f.write(f"{'INTEGRATED CANDIDATE PROFILE SKILL LOG MATRIX':^80}\n")
-        f.write("=" * 80 + "\n")
-        f.write(f"Target Profile Id:    {username}\n")
-        f.write(f"Generated On:         {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"GitHub Repos Scanned: {repos_scanned}\n")
-        f.write(f"Resume Evaluated:     {'Yes' if resume_evaluated else 'No'}\n")
-        f.write(f"LinkedIn Screened:    {'Yes' if linkedin_screened else 'No'}\n")
-        f.write("=" * 80 + "\n\n")
-
-        # Section 1: Aggregated Multi-Channel Taxonomy Scores
-        f.write("=" * 80 + "\n")
-        f.write("1. CONSOLIDATED TAXONOMY WEIGHT PROFILE (ALL CHANNELS)\n")
-        f.write("=" * 80 + "\n")
-        max_possible = max(profile_domain_scores.values()) if profile_domain_scores else 1
-        for domain in DOMAINS:
-            score = profile_domain_scores[domain]
-            bar_len = int((score / max_possible) * 30) if max_possible > 0 else 0
-            bar = "■" * bar_len + "□" * (30 - bar_len)
-            f.write(f"   - {domain:<25} [{bar}] (Total Score: {score})\n")
-        f.write("\n")
-
-        # Section 2: Isolated Cross-Channel Breakdown Matrices
-        f.write("=" * 80 + "\n")
-        f.write("2. SEPARATED ARTIFACT CHANNEL CHANNEL ANALYTICS\n")
-        f.write("=" * 80 + "\n")
-
-        # Resume Sub-section
-        f.write("A. Google Drive Resume Context Metrics:\n")
-        if resume_evaluated and resume_scores:
-            for domain in DOMAINS:
-                if resume_scores[domain] > 0:
-                    kws = resume_keywords.get(domain, {})
-                    top_kw_str = ", ".join(
-                        [f"{k}(x{c})" for k, c in Counter(kws).most_common(5)]
-                    )
-                    f.write(f"   * {domain:<22} -> Subscore: {resume_scores[domain]:<3} | Keywords: {top_kw_str}\n")
-        else:
-            f.write("   [No Resume details submitted or zero taxonomy keywords cataloged]\n")
-        f.write("\n")
-
-        # LinkedIn Sub-section
-        f.write("B. LinkedIn Profile Interface Context Metrics:\n")
-        if linkedin_screened and linkedin_scores:
-            for domain in DOMAINS:
-                if linkedin_scores[domain] > 0:
-                    kws = linkedin_keywords.get(domain, {})
-                    top_kw_str = ", ".join(
-                        [f"{k}(x{c})" for k, c in Counter(kws).most_common(5)]
-                    )
-                    f.write(f"   * {domain:<22} -> Subscore: {linkedin_scores[domain]:<3} | Keywords: {top_kw_str}\n")
-        else:
-            f.write("   [No LinkedIn profiles extracted or zero profile tokens verified]\n")
-        f.write("\n")
-
-        # Codebase Languages Breakdown
-        f.write("C. Code Repository Core Compilation Languages:\n")
-        if profile_languages:
-            for lang, count in profile_languages.most_common():
-                f.write(f"   - {lang:<20} ({count} structural workspace source files)\n")
-        else:
-            f.write("   [No native repositories scanned inside GitHub domain metrics]\n")
-        f.write("\n")
-
-        # Section 3: Core Framework Library and Conceptual Registries
-        f.write("=" * 80 + "\n")
-        f.write("3. DETAILED PHRASE & CONCEPT CONTEXT REGISTRY\n")
-        f.write("=" * 80 + "\n")
-        for domain in DOMAINS:
-            f.write(f" * {domain}:\n")
-            libs = profile_libraries.get(domain, [])
-            if libs:
-                f.write(f"   - Code Libraries: {', '.join(sorted(libs))}\n")
-            kws = profile_keywords.get(domain, {})
-            if kws:
-                top_kws = [f"{kw} (x{count})" for kw, count in Counter(kws).most_common(10)]
-                f.write(f"   - Core Framework Concepts: {', '.join(top_kws)}\n")
-            if not libs and not kws:
-                f.write("   - No domain signals registered across candidate profiles.\n")
-        f.write("\n")
-
-        # Section 4: Code Repository Specific Lineage
-        if repo_analyses:
-            f.write("=" * 80 + "\n")
-            f.write("4. COMPLETE SOURCE WORKSPACE INDEX BREAKDOWN\n")
-            f.write("=" * 80 + "\n")
-            for idx, r in enumerate(repo_analyses, 1):
-                f.write(f"#{idx} Repository Profile: {r['name']} {'(Fork Asset)' if r['fork'] else ''}\n")
-                langs = ", ".join([f"{l} ({c})" for l, c in Counter(r["languages"]).most_common(3)])
-                f.write(f"  - System Languages: {langs if langs else 'None detected'}\n")
-                scores_str = ", ".join([f"{d}: {s}" for d, s in r["scores"].items() if s > 0])
-                f.write(f"  - Structural Weights: {scores_str if scores_str else 'General Space: 0'}\n")
-                f.write("-" * 40 + "\n")
-
-        f.write("=" * 80 + "\n")
-        f.write(f"{'END OF PIPELINE AUDIT REPORT':^80}\n")
-        f.write("=" * 80 + "\n")
-
-    print(f"Aggregated workspace audit profile closed successfully. Manifest logs: {output_path}")
-
-
-# ===================================================================
-# CLI entry point
-# ===================================================================
 
 def main() -> None:
-    """Parse CLI arguments, run the analysis, and write the report."""
-    parser = argparse.ArgumentParser(
-        description="Analyze GitHub profile along with Resume and LinkedIn contexts using core domain taxonomies."
-    )
-    parser.add_argument("username", help="GitHub username or profile URL to analyze")
-    parser.add_argument("--resume", help="Google Drive link pointing directly to applicant's Resume asset", default=None)
-    parser.add_argument("--linkedin", help="Public URL configuration link for Candidate LinkedIn profile", default=None)
-    parser.add_argument("--config", help="Path to domain taxonomy JSON config (default: domains.json)", default=None)
-    parser.add_argument("--token", help="GitHub Personal Access Token", default=None)
-    parser.add_argument("--exclude-forks", action="store_true", help="Exclude forks from indexing metric tallies")
-    parser.add_argument("--output", help="Path to save text report metrics", default=None)
+    parser = argparse.ArgumentParser(description="Evidence-backed GitHub profile analyzer")
+    parser.add_argument("username", help="GitHub username or profile URL")
+    parser.add_argument("--token", default=None, help="GitHub access token (or GITHUB_TOKEN)")
+    parser.add_argument("--resume", default=None, help="Public/direct resume URL")
+    parser.add_argument("--linkedin", default=None, help="Public LinkedIn profile URL")
+    parser.add_argument("--config", default=None, help="Path to domains.json")
+    parser.add_argument("--output", default="profile_analysis.json")
+    parser.add_argument("--exclude-forks", action="store_true")
+    parser.add_argument("--keep-clones", action="store_true")
     args = parser.parse_args()
 
-    results = analyze_candidate(
-        github_username=args.username,
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    result = analyze_candidate(
+        args.username,
+        token=args.token,
         resume_url=args.resume,
         linkedin_url=args.linkedin,
-        token=args.token,
         config_path=args.config,
         exclude_forks=args.exclude_forks,
+        keep_clones=args.keep_clones,
     )
-
-    output_path = args.output or f"{results['username']}_skills_report.txt"
-    write_report(results, output_path)
+    with open(args.output, "w", encoding="utf-8") as fh:
+        json.dump(result, fh, indent=2, ensure_ascii=False)
+    print(f"Analysis written to {args.output}")
 
 
 if __name__ == "__main__":
