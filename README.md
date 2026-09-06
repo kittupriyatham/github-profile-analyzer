@@ -26,11 +26,11 @@ A detected skill is therefore returned together with concrete evidence such as r
 
 Without a token, the analyzer scans the target user's publicly accessible repositories.
 
-With a GitHub access token, the analyzer uses the repositories accessible to that token and includes private repositories owned by the target account when the token has access to them. GitHub's authenticated repository endpoint can expose repositories the authenticated user owns, collaborates on, or can access through organizations; this project filters that accessible set to the requested target account. citeturn0search5turn0search7
+With a GitHub access token, the analyzer uses the repositories accessible to that token and includes private repositories owned by the target account when the token has access to them. GitHub's authenticated repository endpoint can expose repositories the authenticated user owns, collaborates on, or can access through organizations; this project filters that accessible set to the requested target account.
 
 The token is never written into a clone URL or analysis result. Git receives it through an environment-backed HTTP authorization header.
 
-The token must have the repository permissions necessary to read the private repositories you want analyzed. GitHub's Git tree/content APIs likewise require appropriate contents read access for private repositories. citeturn0search0turn0search1
+The token must have the repository permissions necessary to read the private repositories you want analyzed.
 
 ## Entire repository scanning
 
