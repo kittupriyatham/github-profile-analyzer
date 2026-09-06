@@ -1,16 +1,18 @@
 """Batch entry point for GitHub Profile Analyzer.
 
-The application logic lives in ``GitHubProfileAnalyzer``.  This file is only
+The application logic lives in ``GitHubProfileAnalyzer``. This file is only
 responsible for command-line parsing, spreadsheet loading, batch orchestration,
-and export.  Keeping the entry point thin makes the same analyzer usable from
-Python code, notebooks, web services, or future APIs.
+and export. The same analyzer can therefore be imported from Python, notebooks,
+web services, or future APIs.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
+from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from typing import Any
 
@@ -46,7 +48,6 @@ class ProfileAnalysisApplication:
 
         username = self._github_username(github_url)
         if not username:
-            # Resume/LinkedIn-only records remain supported.
             candidate.analysis_error = "No usable GitHub profile URL; only supplementary sources were supplied"
             candidate.analysis_complete = True
             candidate.computed_status = "REVIEW"
@@ -103,7 +104,6 @@ class ProfileAnalysisApplication:
 
     @staticmethod
     def _choose_github(candidate: Any) -> str:
-        """Prefer classical GitHub, then quantum GitHub, preserving old sheets."""
         return (
             getattr(candidate, "classical_github", "")
             or getattr(candidate, "quantum_github", "")
@@ -119,8 +119,7 @@ class ProfileAnalysisApplication:
         value = value.replace(".git", "")
         if "github.com/" in value.lower():
             value = value.split("github.com/", 1)[1]
-        value = value.split("/")[0]
-        return value.strip()
+        return value.split("/")[0].strip()
 
     @staticmethod
     def _attach_result(candidate: Any, result: dict[str, Any]) -> None:
@@ -130,9 +129,6 @@ class ProfileAnalysisApplication:
         candidate.total_score = result.get("total_score", 0)
         candidate.primary_domain = result.get("primary_domain", "")
         candidate.repos_scanned = result.get("repositories_discovered", 0)
-
-        # New evidence-first fields. The loader is backward-compatible, but
-        # these fields can also be added dynamically to old CandidateRecord objects.
         candidate.skills = result.get("skills", [])
         candidate.evidence = result.get("evidence", [])
         candidate.insights = result.get("insights", {})
@@ -148,7 +144,7 @@ class ProfileAnalysisApplication:
 
     @staticmethod
     def _apply_screening_decision(candidate: Any) -> None:
-        """Apply intentionally conservative hiring buckets to evidence scores."""
+        """Apply conservative screening buckets to evidence-derived scores."""
         scores = candidate.domain_scores or {}
         quantum = int(scores.get("Quantum Technology", 0))
         ml = int(scores.get("ML/DL/DS/AI", 0))
@@ -157,11 +153,8 @@ class ProfileAnalysisApplication:
         math = int(scores.get("Mathematics & Foundations", 0))
         total = int(sum(scores.values()))
 
-        has_q = quantum >= 5
-        has_ml = ml >= 5
-        has_se = software >= 5
-        has_cloud = cloud >= 5
-        has_math = math >= 5
+        has_q, has_ml = quantum >= 5, ml >= 5
+        has_se, has_cloud, has_math = software >= 5, cloud >= 5, math >= 5
 
         if total < 10:
             status, bucket, reason = "REJECT", "ML/AI/DS", f"Insufficient evidence score ({total})"
@@ -184,10 +177,23 @@ class ProfileAnalysisApplication:
         candidate.status_reason = reason
 
 
+def _jsonable(value: Any) -> Any:
+    if is_dataclass(value):
+        return asdict(value)
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, set):
+        return sorted(_jsonable(v) for v in value)
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Evidence-backed GitHub profile analyzer")
     parser.add_argument("input_spreadsheet", help="Path to candidate CSV/XLSX")
     parser.add_argument("--output", default="qintern_results.xlsx", help="Output Excel filename")
+    parser.add_argument("--json-output", default=None, help="Optional companion JSON file containing full evidence")
     parser.add_argument("--config", default=None, help="Path to domains.json")
     parser.add_argument("--token", default=None, help="GitHub access token (or GITHUB_TOKEN)")
     parser.add_argument("--exclude-forks", action="store_true", help="Exclude forked repositories")
@@ -211,7 +217,20 @@ def main() -> None:
     candidates, metadata = app.analyze_batch(candidates)
 
     output_path = export_results(candidates, args.output, run_metadata=metadata)
-    logger.info("Analysis complete: %s", output_path)
+    logger.info("Excel results: %s", output_path)
+
+    if args.json_output:
+        json_path = args.json_output
+    else:
+        json_path = os.path.splitext(args.output)[0] + ".json"
+
+    payload = {
+        "run_metadata": metadata,
+        "candidates": [_jsonable(c) for c in candidates],
+    }
+    with open(json_path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, ensure_ascii=False)
+    logger.info("Full evidence JSON: %s", os.path.abspath(json_path))
 
 
 if __name__ == "__main__":
