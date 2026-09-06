@@ -1,0 +1,11 @@
+pandas
+openpyxl
+requests
+beautifulsoup4
+lxml
+pdfplumber
+PyPDF2
+playwright
+gitpython
+tqdm
+rapidfuzz

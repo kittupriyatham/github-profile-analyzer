@@ -1,0 +1,111 @@
+{
+    "domains": {
+        "ML/DL/DS/AI": {
+            "libraries": [
+                "tensorflow", "keras", "torch", "pytorch", "sklearn", "scikit-learn",
+                "pandas", "numpy", "jax", "scipy", "matplotlib", "seaborn", "transformers",
+                "huggingface", "spacy", "nltk", "gensim", "xgboost", "lightgbm", "catboost",
+                "opencv", "cv2", "langchain", "llama-index", "fastai", "keras-nlp", "diffusers",
+                "tensorboard", "mlflow", "wandb", "optuna", "gym", "stable-baselines3",
+                "gemini", "openai", "anthropic", "crewai", "autogen", "power_bi", "powerbi",
+                "tableau", "plotly", "bokeh", "streamlit", "gradio", "onnx", "mediapipe",
+                "ultralytics", "detectron2", "pytesseract", "easyocr"
+            ],
+            "keywords": [
+                "machine learning", "deep learning", "data science", "artificial intelligence",
+                "neural network", "computer vision", "nlp", "natural language processing",
+                "cnn", "rnn", "lstm", "gan", "transformer", "bert", "gpt", "llm", "classification",
+                "regression", "clustering", "supervised", "unsupervised", "reinforcement learning",
+                "model training", "inference", "dataset", "feature engineering", "backpropagation",
+                "gradient descent", "fine tuning", "overfitting", "precision", "recall", "f1 score",
+                "model deployment", "model accuracy", "ocr", "object detection", "image classification",
+                "autonomous agent", "ai agent", "rag", "retrieval augmented", "embeddings",
+                "vector database", "prompt engineering", "generative ai", "gemini", "data visualization",
+                "data analysis", "data pipeline", "etl", "data engineering"
+            ]
+        },
+        "Quantum Technology": {
+            "libraries": [
+                "qiskit", "cirq", "pennylane", "qutip", "qasm", "pyquil", "dwave",
+                "strawberryfields", "blueqat", "braket", "qiskit_aer", "qiskit_ibm_runtime",
+                "qiskit_machine_learning", "qiskit_nature", "qiskit_optimization", "qiskit_finance",
+                "openfermion", "projectq",
+                "qbraid", "azure_quantum", "azure-quantum", "amazon_braket", "qiskit_algorithms",
+                "mitiq", "stim", "cudaq", "tket"
+            ],
+            "keywords": [
+                "quantum", "qubit", "quantum computing", "quantum mechanics", "quantum circuit",
+                "bell state", "grover", "shor", "vqa", "vqe", "qaoa", "qml", "quantum machine learning",
+                "superposition", "entanglement", "teleportation", "bloch sphere", "density matrix",
+                "hamiltonian", "quantum gate", "unitary", "schrodinger", "quantum state", "phase estimation",
+                "amplitude amplification", "hadamard", "cnot", "paulix", "pauliy", "pauliz", "decoherence",
+                "ghz state", "superdense coding", "quantum half adder", "quantum simulator",
+                "quantum error correction", "quantum advantage", "quantum supremacy", "quantum algorithm",
+                "quantum cryptography", "quantum key distribution", "quantum annealing",
+                "noise model", "variational circuit", "parameterized circuit"
+            ]
+        },
+        "Software Engineering": {
+            "libraries": [
+                "react", "angular", "vue", "next", "express", "flask", "django", "fastapi",
+                "spring", "spring-boot", "spring_boot", "docker", "kubernetes", "ansible",
+                "terraform", "pytest", "unittest", "redis", "postgresql", "mysql", "mongodb",
+                "sqlite", "graphql", "celery",
+                "qt", "qml", "gin", "fiber", "actix", "nestjs", "svelte", "nuxt",
+                "sequelize", "prisma", "sqlalchemy", "hibernate",
+                "git"
+            ],
+            "keywords": [
+                "design patterns", "oop", "object-oriented", "functional programming",
+                "ci/cd", "continuous integration", "continuous deployment", "microservices",
+                "rest api", "restful api", "graphql", "websocket", "database", "sql", "nosql",
+                "dockerfile", "refactoring", "unit test", "integration test", "version control", "git",
+                "multithreading", "asynchronous", "concurrency", "solid principles", "dry principle",
+                "crud", "full stack", "full-stack", "system design", "system architecture",
+                "api gateway", "load balancer", "caching", "message queue", "event driven",
+                "agile", "scrum", "code review", "pull request", "technical debt"
+            ]
+        },
+        "Cloud & DevOps": {
+            "libraries": [
+                "boto3", "awscli", "aws-cdk", "azure-sdk", "azure-cli", "google-cloud",
+                "gcloud", "pulumi", "cloudformation", "sam", "serverless",
+                "nginx", "apache", "gunicorn", "uvicorn", "pm2"
+            ],
+            "keywords": [
+                "aws", "azure", "gcp", "google cloud", "cloud computing", "cloud deployment",
+                "app service", "ec2", "s3", "lambda", "cloud functions", "azure functions",
+                "ecs", "eks", "aks", "gke", "fargate",
+                "iaas", "paas", "saas", "serverless", "containerization",
+                "devops", "infrastructure as code", "monitoring", "logging", "observability",
+                "load balancing", "auto scaling", "cdn", "dns", "ssl", "tls",
+                "pipeline", "github actions", "gitlab ci", "jenkins", "terraform",
+                "virtual machine", "cloud storage", "blob storage"
+            ]
+        },
+        "Mathematics & Foundations": {
+            "libraries": [
+                "sympy", "numpy", "scipy", "matplotlib", "sage", "mathematica",
+                "mpmath", "statsmodels", "pymc", "arviz", "networkx", "cvxpy",
+                "autograd", "theano", "manim"
+            ],
+            "keywords": [
+                "linear algebra", "probability", "numerical methods", "advanced calculus",
+                "calculus", "differential equations", "statistics", "optimization",
+                "matrix", "eigenvalue", "eigenvector", "determinant", "vector space",
+                "fourier transform", "laplace transform", "convolution",
+                "bayesian", "markov chain", "monte carlo", "stochastic",
+                "combinatorics", "graph theory", "number theory", "discrete mathematics",
+                "mathematical proof", "theorem", "lemma", "corollary",
+                "gradient", "hessian", "jacobian", "partial derivative",
+                "interpolation", "approximation", "numerical integration",
+                "hypothesis testing", "confidence interval", "p-value", "chi-square",
+                "normal distribution", "poisson", "binomial distribution"
+            ]
+        }
+    },
+    "important_repo_thresholds": {
+        "default_min_score": 5,
+        "secondary_min_score": 15
+    }
+}
